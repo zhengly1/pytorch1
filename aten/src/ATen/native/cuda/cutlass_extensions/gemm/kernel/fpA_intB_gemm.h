@@ -181,12 +181,16 @@ struct GemmFpAIntB {
         // Methods
         //
 
+        CUTLASS_HOST_DEVICE
         Params(): swizzle_log_tile(0), semaphore(0), gemm_k_size(0) {}
 
-        Params(Arguments const&                args,
-               int                             device_sms,
-               int                             sm_occupancy):
+        CUTLASS_HOST_DEVICE
+        Params(Arguments const&                     args,
+               cutlass::gemm::GemmCoord const&      grid_tiled_shape,
+               const int                           gemm_k_size,
+               void*                               workspace = nullptr):
             problem_size(args.problem_size),
+            grid_tiled_shape(grid_tiled_shape),
             swizzle_log_tile(ThreadblockSwizzle().get_log_tile(grid_tiled_shape)),
             params_A(args.ref_A.layout()),
             ref_A(args.ref_A),
@@ -199,33 +203,15 @@ struct GemmFpAIntB {
             params_D(args.ref_D.layout()),
             ref_D(args.ref_D),
             output_op(args.output_op),
+            semaphore(static_cast<int*>(workspace)),
+            gemm_k_size(gemm_k_size),
             gather_A_indices(args.gather_A_indices),
             gather_B_indices(args.gather_B_indices),
             scatter_D_indices(args.scatter_D_indices)
         {
-            ThreadblockSwizzle swizzle;
-            grid_tiled_shape = swizzle.get_tiled_shape(
-                args.problem_size,
-                {ThreadblockShape::kM, ThreadblockShape::kN, ThreadblockShape::kK},
-                args.batch_count);
-
-            gemm_k_size = args.problem_size.k();
         }
 
-        size_t get_workspace_size() const
-        {
-            return 0;
-        }
 
-        Status init_workspace(void *workspace,cudaStream_t stream = nullptr)
-        {
-            return Status::kSuccess;
-        }
-
-        dim3 get_grid_dims() const
-        {
-            return ThreadblockSwizzle().get_grid_shape(grid_tiled_shape);
-        }
     };
 
     /// Shared memory storage structure
@@ -473,12 +459,12 @@ struct GemmFpAIntB {
         }
     };
 
-    CUTLASS_DEVICE
-    static void invoke(Params const &params, SharedStorage &shared_storage)
+    static size_t get_extra_workspace_size(Arguments const& args, cutlass::gemm::GemmCoord const& grid_tiled_shape)
     {
-        GemmFpAIntB op;
-        op(params, shared_storage);
+
+        return 0;
     }
+
 
     /*
         To improve compilation speed, we do not compile the device operator if the CUDA_ARCH does not correspond
