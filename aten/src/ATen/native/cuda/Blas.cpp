@@ -21,6 +21,7 @@
 #include <ATen/native/cuda/ScaledGroupMM.h>
 #include <ATen/native/cuda/GroupMM.h>
 #include <ATen/ceil_div.h>
+#include <ATen/native/cuda/UlpGemm.h>
 
 #ifdef USE_FBGEMM_GENAI
 #include <fbgemm_gpu/torch_ops.h>
@@ -272,6 +273,14 @@ cuda::blas::GEMMAndBiasActivationEpilogue activation_to_gemm_and_blas_arg(Activa
 
 static bool getDisableAddmmCudaLt() {
     static const auto env_value = c10::utils::get_env("DISABLE_ADDMM_CUDA_LT");
+    if (env_value == "1") {
+      return true;
+    }
+    return false;
+}
+
+static bool getEnableCutlassUlp() {
+    static const auto env_value = c10::utils::get_env("ENABLE_CUTLASS_ULP");
     if (env_value == "1") {
       return true;
     }
@@ -578,7 +587,62 @@ Tensor& addmm_out_cuda_impl(Tensor& result, const Tensor& self, const Tensor& ma
 #endif
   } else
   {
-    if (is_float_output_with_half_input) {
+    // Check if CUTLASS ULP should be used instead of cuBLAS
+    static bool use_cutlass_ulp = getEnableCutlassUlp();
+    
+    if (use_cutlass_ulp && !is_float_output_with_half_input) {
+      // Use CUTLASS GEMM with ULP perturbation (not supported for mixed precision yet)
+      AT_DISPATCH_FLOATING_TYPES_AND2(
+        at::ScalarType::Half,
+        at::ScalarType::BFloat16,
+        scalar_type,
+        "addmm_cuda_cutlass_ulp",
+        [&] {
+          using opmath_t = at::opmath_type<scalar_t>;
+          opmath_t alpha_val = alpha.to<opmath_t>();
+          opmath_t beta_val = beta.to<opmath_t>();
+          const scalar_t* mat1_ptr = args.mata->const_data_ptr<scalar_t>();
+          const scalar_t* mat2_ptr = args.matb->const_data_ptr<scalar_t>();
+          scalar_t* result_ptr = args.result->mutable_data_ptr<scalar_t>();
+          
+          bool transpose_a = (args.transa == 't');
+          bool transpose_b = (args.transb == 't');
+          
+          // Try cuBLAS GEMM with ULP perturbation
+          bool ulp_success = gemm_with_ulp_perturbation<scalar_t>(
+              transpose_a,
+              transpose_b,
+              args.m,
+              args.n,
+              args.k,
+              alpha_val,
+              mat1_ptr,
+              args.lda,
+              mat2_ptr,
+              args.ldb,
+              beta_val,
+              result_ptr,
+              args.result_ld);
+          
+          // Fallback to cuBLAS if ULP GEMM fails
+          if (!ulp_success) {
+            at::cuda::blas::gemm<scalar_t>(
+                args.transa,
+                args.transb,
+                args.m,
+                args.n,
+                args.k,
+                alpha_val,
+                mat1_ptr,
+                args.lda,
+                mat2_ptr,
+                args.ldb,
+                beta_val,
+                result_ptr,
+                args.result_ld);
+          }
+        });
+    } else if (is_float_output_with_half_input) {
       AT_DISPATCH_REDUCED_FLOATING_TYPES(
         scalar_type,
         "addmm_cuda",
